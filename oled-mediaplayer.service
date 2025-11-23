@@ -1,0 +1,16 @@
+[Unit]
+Description=Oled Display for Home Assistant mediaplayer
+After=network.target
+
+[Service]
+Type=simple
+User=dietpi
+Group=dietpi
+WorkingDirectory=/home/$HOME/oled-mediaplayer
+ExecStart=/usr/bin/python3 /home/$HOME/oled-mediaplayer/main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

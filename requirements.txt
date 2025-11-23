@@ -1,0 +1,4 @@
+luma.oled
+Pillow
+requests
+python-dotenv
