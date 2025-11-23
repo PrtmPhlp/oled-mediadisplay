@@ -21,7 +21,7 @@ I2C_ADDR = 0x3C
 WIDTH, HEIGHT = 128, 64
 ROTATE = 2
 
-FONT_FILENAME = "PixelOperator.ttf"
+FONT_FILENAME = "fonts/PixelOperator.ttf"
 FONT_SIZE = 16
 
 HA_BASE_URL = os.getenv("HA_BASE_URL", "http://localhost:8123/api/states")
@@ -88,6 +88,7 @@ class HomeAssistantClient:
             attributes = data.get("attributes", {})
             title = attributes.get("media_title")
             if title:
+                print(title)
                 return str(title).strip()
         return None
 
