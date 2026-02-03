@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time
 import os
-import requests
+import time
+import threading
 from random import randrange
 from pathlib import Path
 from typing import Optional, Any
@@ -11,9 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from luma.core.interface.serial import i2c
 from luma.oled.device import sh1106
 from luma.core.render import canvas
-from dotenv import load_dotenv
-
-load_dotenv()
+import paho.mqtt.client as mqtt
 
 # config
 I2C_PORT = 1
@@ -24,12 +22,12 @@ ROTATE = 2
 FONT_FILENAME = "fonts/PixelOperator.ttf"
 FONT_SIZE = 16
 
-HA_BASE_URL = os.getenv("HA_BASE_URL", "http://localhost:8123/api/states")
-HA_MEDIA_PLAYER = os.getenv("HA_MEDIA_PLAYER", "media_player.hifi_stereo")
-HA_DISPLAY_HELPER = os.getenv("HA_DISPLAY_HELPER", "input_boolean.display_anlage")
-HA_TOKEN = os.getenv("HA_TOKEN", "")
-HA_TIMEOUT = 2.5
-REFRESH_INTERVAL = 20  # in s
+# MQTT Config (load from environment)
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USER = os.getenv("MQTT_USER", "")
+MQTT_PASS = os.getenv("MQTT_PASS", "")
+MQTT_TOPIC_BASE = os.getenv("MQTT_TOPIC_BASE", "iotstack/shairport")
 
 FPS = 30
 SCROLL_SPEED = 2
@@ -58,39 +56,95 @@ def get_text_width(font: Any, text: str) -> int:
     return int(bbox[2] - bbox[0])
 
 
-class HomeAssistantClient:
-    def __init__(self, base_url: str, token: str):
-        self.base_url = base_url
-        self.headers = {
-            "Authorization": token,
-            "Content-Type": "application/json"
-        }
+class ShairportMQTTClient:
+    """MQTT client for receiving shairport-sync metadata."""
 
-    def _get_state(self, entity_id: str) -> Optional[dict]:
+    def __init__(self, broker: str, port: int, username: str, password: str, topic_base: str):
+        self.broker = broker
+        self.port = port
+        self.topic_base = topic_base
+
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        self.client.username_pw_set(username, password)
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.client.on_disconnect = self._on_disconnect
+
+        # Thread-safe data storage
+        self._lock = threading.Lock()
+        self._title: Optional[str] = None
+        self._artist: Optional[str] = None
+        self._is_active: bool = False
+        self._connected: bool = False
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        print(f"MQTT connected with result code {reason_code}")
+        self._connected = True
+        # Subscribe to relevant topics
+        topics = [
+            f"{self.topic_base}/title",
+            f"{self.topic_base}/artist",
+            f"{self.topic_base}/active_start",
+            f"{self.topic_base}/active_end",
+            f"{self.topic_base}/play_start",
+            f"{self.topic_base}/play_end",
+        ]
+        for topic in topics:
+            client.subscribe(topic)
+            print(f"Subscribed to {topic}")
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties):
+        print(f"MQTT disconnected with result code {reason_code}")
+        self._connected = False
+
+    def _on_message(self, client, userdata, msg):
+        topic = msg.topic
+        payload = msg.payload.decode("utf-8", errors="ignore").strip()
+
+        print(f"MQTT: {topic} = {payload[:50] if payload else '(empty)'}")
+
+        with self._lock:
+            if topic == f"{self.topic_base}/title":
+                self._title = payload if payload and payload != "--" else None
+            elif topic == f"{self.topic_base}/artist":
+                self._artist = payload if payload and payload != "--" else None
+            elif topic == f"{self.topic_base}/active_start":
+                self._is_active = True
+            elif topic == f"{self.topic_base}/active_end":
+                self._is_active = False
+                self._title = None
+                self._artist = None
+            elif topic == f"{self.topic_base}/play_end":
+                # Song ended, clear title (but session may still be active)
+                self._title = None
+                self._artist = None
+
+    def start(self):
+        """Start the MQTT client in a background thread."""
         try:
-            url = f"{self.base_url}/{entity_id}"
-            response = requests.get(url, headers=self.headers, timeout=HA_TIMEOUT)
-            if response.status_code == 200:
-                return response.json()
-        except Exception:
-            pass
-        return None
+            self.client.connect(self.broker, self.port, keepalive=60)
+            self.client.loop_start()
+        except Exception as e:
+            print(f"MQTT connection error: {e}")
 
-    def is_display_on(self, entity_id: str) -> bool:
-        data = self._get_state(entity_id)
-        if data:
-            return data.get("state") == "on"
-        return False
+    def stop(self):
+        """Stop the MQTT client."""
+        self.client.loop_stop()
+        self.client.disconnect()
 
-    def get_media_title(self, entity_id: str) -> Optional[str]:
-        data = self._get_state(entity_id)
-        if data:
-            attributes = data.get("attributes", {})
-            title = attributes.get("media_title")
-            if title:
-                print(title)
-                return str(title).strip()
-        return None
+    def is_active(self) -> bool:
+        """Check if there's an active AirPlay session."""
+        with self._lock:
+            return self._is_active
+
+    def get_display_title(self) -> Optional[str]:
+        """Get formatted title (with artist if available)."""
+        with self._lock:
+            if not self._title:
+                return None
+            if self._artist:
+                return f"{self._artist} - {self._title}"
+            return self._title
 
 
 class Starfield:
@@ -221,38 +275,32 @@ def main():
     font_path = Path(__file__).parent / FONT_FILENAME
     font = get_font(font_path, FONT_SIZE)
 
-    ha_client = HomeAssistantClient(HA_BASE_URL, HA_TOKEN)
+    mqtt_client = ShairportMQTTClient(
+        broker=MQTT_BROKER,
+        port=MQTT_PORT,
+        username=MQTT_USER,
+        password=MQTT_PASS,
+        topic_base=MQTT_TOPIC_BASE
+    )
+    mqtt_client.start()
+
     starfield = Starfield(WIDTH, HEIGHT, STAR_NUM, STAR_MAX_DEPTH)
     title_display = TitleDisplay(WIDTH, font)
 
-    next_ha_check = 0
     title = None
-    display_active = True
 
     try:
         while True:
             start_time = time.time()
 
-            # 1. Update Data
-            if start_time >= next_ha_check:
-                display_active = ha_client.is_display_on(HA_DISPLAY_HELPER)
-                if display_active:
-                    title = ha_client.get_media_title(HA_MEDIA_PLAYER)
-                    device.show()
-                else:
-                    device.hide()
-
-                next_ha_check = start_time + REFRESH_INTERVAL
-
-            if not display_active:
-                time.sleep(1)
-                continue
+            # 1. Get current state from MQTT (no polling needed - data is pushed)
+            title = mqtt_client.get_display_title()
 
             # 2. Update State
             if title:
                 title_display.set_title(title)
                 title_display.update()
-                # Partial Starfield
+                # Partial Starfield (below title)
                 starfield.set_viewport(0, STAR_VIEW_Y_OFFSET, WIDTH, HEIGHT - STAR_VIEW_Y_OFFSET)
             else:
                 # Full Starfield
@@ -273,6 +321,8 @@ def main():
 
     except KeyboardInterrupt:
         pass
+    finally:
+        mqtt_client.stop()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+[Unit]
+Description=Oled mediaplayer mqtt translator
+After=network.target
+
+[Service]
+Type=simple
+User=dietpi
+Group=dietpi
+WorkingDirectory=/home/dietpi/oled-mediaplayer
+ExecStart=/usr/bin/python3 /home/dietpi/oled-mediaplayer/cpp/mqtt_cover_translator.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
