@@ -44,18 +44,20 @@ class CoverTranslator:
         subtopic = msg.topic[len(topic_in_base) + 1:]
         new_topic = f"{self.args.topic_out}/{subtopic}"
 
-        # Special handling for cover: convert to bitmap
+        # Special handling for cover: convert to bitmap and publish as cover_mono
         if subtopic == "cover":
             payload = msg.payload
             if payload == b"--":
-                client.publish(new_topic, payload, retain=True)
-                print(f"Published empty cover to {new_topic}")
+                mono_topic = f"{self.args.topic_out}/cover_mono"
+                client.publish(mono_topic, payload, retain=True)
+                print(f"Published empty cover to {mono_topic}")
                 return
 
             try:
                 bitmap = self._convert_cover(payload)
-                client.publish(new_topic, bitmap, retain=True)
-                print(f"Published {len(bitmap)} bytes (converted cover) to {new_topic}")
+                mono_topic = f"{self.args.topic_out}/cover_mono"
+                client.publish(mono_topic, bitmap, retain=True)
+                print(f"Published {len(bitmap)} bytes (converted cover) to {mono_topic}")
             except Exception as exc:
                 print(f"Convert error: {exc}")
             return
