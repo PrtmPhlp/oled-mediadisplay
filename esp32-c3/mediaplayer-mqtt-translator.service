@@ -7,7 +7,8 @@ Type=simple
 User=dietpi
 Group=dietpi
 WorkingDirectory=/home/dietpi/oled-mediaplayer
-ExecStart=/usr/bin/python3 /home/dietpi/oled-mediaplayer/cpp/mqtt_cover_translator.py
+EnvironmentFile=/home/dietpi/oled-mediaplayer/.env
+ExecStart=/usr/bin/python3 /home/dietpi/oled-mediaplayer/esp32-c3/mqtt_cover_translator.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
