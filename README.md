@@ -1,5 +1,7 @@
 # OLED Media Display
 
+![OLED Media Display](images/cover.jpeg)
+
 Display media player metadata (artist, title, cover art) from Shairport Sync via MQTT on 128x64px OLED displays.
 
 ## Features
