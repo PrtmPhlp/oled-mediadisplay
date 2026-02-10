@@ -8,7 +8,7 @@
 
 #include "credentials.h"
 
-constexpr uint32_t DISPLAY_TIMEOUT_MS = 5UL * 60UL * 1000UL; // 5min
+constexpr uint32_t DISPLAY_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5min
 // ESP32-C3 I2C pins
 constexpr int I2C_SDA_PIN = 8;
 constexpr int I2C_SCL_PIN = 9;
@@ -81,7 +81,7 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.mode(WIFI_STA);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Max TX
-  
+
   // MQTT
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setKeepAlive(15);
@@ -151,7 +151,7 @@ void ensureWifi() {
   static uint32_t lastWifiAttempt = 0;
   static uint8_t wifiFailCount = 0;
   const uint32_t now = millis();
-  
+
   if (WiFi.status() == WL_CONNECTED) {
     wifiFailCount = 0;
     return;
@@ -177,7 +177,7 @@ void ensureWifi() {
 
   Serial.printf("Connecting to Wi-Fi %s...\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  
+
   uint8_t retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 20) {
     delay(500);
@@ -185,7 +185,7 @@ void ensureWifi() {
     retries++;
   }
   Serial.println();
-  
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("Wi-Fi connected, IP: ");
     Serial.println(WiFi.localIP());
@@ -204,7 +204,7 @@ void ensureMqtt() {
 
   static uint32_t lastMqttAttempt = 0;
   const uint32_t now = millis();
-  
+
   if (now - lastMqttAttempt < 5000) {
     return;
   }
@@ -304,7 +304,7 @@ void handleDisplayControlPayload(const uint8_t *payload, size_t length) {
       lastActivityMs = millis();
       needsRedraw = true;
     }
-    
+
     publishDisplayState();
   }
 }
@@ -431,6 +431,9 @@ void splitTextIntoLines(const String &text, int maxWidth, String &line1, String 
     }
   }
 
-  if (line1.length() == 0) { line1 = text; line2 = ""; }
+  if (line1.length() == 0) {
+    line1 = text;
+    line2 = "";
+  }
   line1 = truncateTextToWidth(line1, maxWidth);
 }

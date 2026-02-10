@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import os
 import time
@@ -13,7 +12,6 @@ from luma.oled.device import sh1106
 from luma.core.render import canvas
 import paho.mqtt.client as mqtt
 
-# config
 I2C_PORT = 1
 I2C_ADDR = 0x3C
 WIDTH, HEIGHT = 128, 64
@@ -22,7 +20,6 @@ ROTATE = 2
 FONT_FILENAME = "fonts/PixelOperator.ttf"
 FONT_SIZE = 16
 
-# MQTT Config (load from environment)
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_USER", "")
@@ -31,16 +28,15 @@ MQTT_TOPIC_BASE = os.getenv("MQTT_TOPIC_BASE", "iotstack/shairport")
 
 FPS = 30
 SCROLL_SPEED = 2
-SCROLL_DELAY = 2.0  # wait before scrollen (in s)
+SCROLL_DELAY = 2.0
 GAP_PX = 32
 
 STAR_NUM = 512
 STAR_MAX_DEPTH = 32
 STAR_Z_STEP = 0.2
-STAR_VIEW_Y_OFFSET = 15  # Height of title bar
+STAR_VIEW_Y_OFFSET = 15
 
 
-# Helpers
 def get_font(path: Path, size: int) -> Any:
     try:
         return ImageFont.truetype(str(path), size)
@@ -49,7 +45,6 @@ def get_font(path: Path, size: int) -> Any:
 
 
 def get_text_width(font: Any, text: str) -> int:
-    # Create a dummy image to use textbbox
     tmp = Image.new("1", (1, 1))
     d = ImageDraw.Draw(tmp)
     bbox = d.textbbox((0, 0), text, font=font)
@@ -57,8 +52,6 @@ def get_text_width(font: Any, text: str) -> int:
 
 
 class ShairportMQTTClient:
-    """MQTT client for receiving shairport-sync metadata."""
-
     def __init__(self, broker: str, port: int, username: str, password: str, topic_base: str):
         self.broker = broker
         self.port = port
@@ -70,7 +63,6 @@ class ShairportMQTTClient:
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
 
-        # Thread-safe data storage
         self._lock = threading.Lock()
         self._title: Optional[str] = None
         self._artist: Optional[str] = None
@@ -80,7 +72,6 @@ class ShairportMQTTClient:
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         print(f"MQTT connected with result code {reason_code}")
         self._connected = True
-        # Subscribe to relevant topics
         topics = [
             f"{self.topic_base}/title",
             f"{self.topic_base}/artist",
@@ -115,12 +106,10 @@ class ShairportMQTTClient:
                 self._title = None
                 self._artist = None
             elif topic == f"{self.topic_base}/play_end":
-                # Song ended, clear title (but session may still be active)
                 self._title = None
                 self._artist = None
 
     def start(self):
-        """Start the MQTT client in a background thread."""
         try:
             self.client.connect(self.broker, self.port, keepalive=60)
             self.client.loop_start()
@@ -128,17 +117,14 @@ class ShairportMQTTClient:
             print(f"MQTT connection error: {e}")
 
     def stop(self):
-        """Stop the MQTT client."""
         self.client.loop_stop()
         self.client.disconnect()
 
     def is_active(self) -> bool:
-        """Check if there's an active AirPlay session."""
         with self._lock:
             return self._is_active
 
     def get_display_title(self) -> Optional[str]:
-        """Get formatted title (with artist if available)."""
         with self._lock:
             if not self._title:
                 return None
@@ -156,7 +142,6 @@ class Starfield:
         self.stars = []
         self.init_stars()
 
-        # Viewport defaults to full screen
         self.vp_x = 0
         self.vp_y = 0
         self.vp_w = width
@@ -175,7 +160,6 @@ class Starfield:
         self.vp_y = y
         self.vp_w = w
         self.vp_h = h
-        # Center origin in the new viewport
         self.origin_x = x + w // 2
         self.origin_y = y + h // 2
 
@@ -193,7 +177,6 @@ class Starfield:
 
             if (self.vp_x <= x < self.vp_x + self.vp_w) and (self.vp_y <= y < self.vp_y + self.vp_h):
                 draw.point((x, y), fill=255)
-                # Make near stars slightly bigger
                 if (1 - star[2] / self.max_depth) * 4 >= 2:
                     draw.point((x + 1, y), fill=255)
 
@@ -219,7 +202,6 @@ class TitleDisplay:
         self.waiting_to_scroll = True
         self.scroll_wait_start = time.time()
 
-        # Determine display format
         base_w = get_text_width(self.font, title)
         dashed = f"- {title} -"
         dashed_w = get_text_width(self.font, dashed)
@@ -233,7 +215,7 @@ class TitleDisplay:
             self.text_width = base_w
             self.is_scrolling = False
         else:
-            self.display_text = title + "   "  # Add gap for scrolling
+            self.display_text = title + "   "
             self.text_width = get_text_width(self.font, self.display_text)
             self.is_scrolling = True
 
@@ -255,23 +237,19 @@ class TitleDisplay:
 
     def draw(self, draw: ImageDraw.ImageDraw, y: int):
         if not self.is_scrolling:
-            # Center
             x = (self.width - self.text_width) // 2
             draw.text((x, y), self.display_text, font=self.font, fill=255)
         else:
-            # Scroll
             x = -int(self.scroll_offset)
             draw.text((x, y), self.display_text, font=self.font, fill=255)
             draw.text((x + self.text_width, y), self.display_text, font=self.font, fill=255)
 
 
 def main():
-    # Setup Device
     serial = i2c(port=I2C_PORT, address=I2C_ADDR)
     device = sh1106(serial, width=WIDTH, height=HEIGHT, rotate=ROTATE)
     device.contrast(255)
 
-    # Setup Components
     font_path = Path(__file__).parent / FONT_FILENAME
     font = get_font(font_path, FONT_SIZE)
 
@@ -293,27 +271,21 @@ def main():
         while True:
             start_time = time.time()
 
-            # 1. Get current state from MQTT (no polling needed - data is pushed)
             title = mqtt_client.get_display_title()
 
-            # 2. Update State
             if title:
                 title_display.set_title(title)
                 title_display.update()
-                # Partial Starfield (below title)
                 starfield.set_viewport(0, STAR_VIEW_Y_OFFSET, WIDTH, HEIGHT - STAR_VIEW_Y_OFFSET)
             else:
-                # Full Starfield
                 starfield.set_viewport(0, 0, WIDTH, HEIGHT)
 
-            # 3. Draw
             with canvas(device) as draw:
                 if title:
                     title_display.draw(draw, y=0)
 
                 starfield.update_and_draw(draw)
 
-            # 4. FPS Control
             elapsed = time.time() - start_time
             sleep_time = (1.0 / FPS) - elapsed
             if sleep_time > 0:
