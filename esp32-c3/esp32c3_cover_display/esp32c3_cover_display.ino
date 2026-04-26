@@ -5,6 +5,8 @@
 #include <PubSubClient.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <math.h>
+#include <stdarg.h>
 
 #include "credentials.h"
 
@@ -14,6 +16,7 @@ constexpr int I2C_SDA_PIN = 8;
 constexpr int I2C_SCL_PIN = 9;
 
 constexpr uint16_t MQTT_BUFFER_SIZE = 4096;  // mono bitmap payload is small
+constexpr uint16_t LOG_BUFFER_SIZE = 192;
 constexpr uint8_t COVER_BYTES_PER_ROW = (48 + 7) / 8;
 constexpr uint16_t COVER_BITMAP_BYTES = COVER_BYTES_PER_ROW * 48;
 
@@ -25,6 +28,13 @@ constexpr uint8_t TITLE_Y2 = 36;  // Second Title-Row
 constexpr uint8_t TITLE_Y3 = 46;  // Third Title-Row
 constexpr uint8_t PAUSED_Y = 56;
 constexpr uint8_t X_OFFSET = 2;
+
+// GY-512 (MPU-6050) vibration / knock detection
+constexpr uint8_t MPU6050_ADDR = 0x68;
+constexpr float KNOCK_THRESHOLD_G = 0.26f;
+constexpr uint32_t KNOCK_COOLDOWN_MS = 1000;
+constexpr uint32_t MOTION_OFF_DELAY_MS = 10000;  // 5s after last knock -> OFF
+constexpr uint16_t CALIBRATION_SAMPLES = 200;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -48,6 +58,15 @@ static uint32_t coverPendingSince = 0;
 // MQTT toggle
 static bool displayRemoteEnabled = true;
 
+// MPU-6050 motion state
+static float baseAx = 0, baseAy = 0, baseAz = 0;
+static bool motionSensorAvailable = false;
+static bool motionPublished = false;
+static bool motionPublishPending = false;
+static uint32_t motionLastKnockMs = 0;
+static uint32_t motionLastTriggerMs = 0;
+static bool motionDiscoverySent = false;
+
 void ensureWifi();
 void ensureMqtt();
 void refreshDisplay();
@@ -62,12 +81,50 @@ String truncateTextToWidth(const String &value, int maxWidth);
 void splitTextIntoLines(const String &text, int maxWidth, String &line1, String &line2);
 bool isVowel(char c);
 void logPayloadPreview(const uint8_t *payload, size_t length);
+bool readAccel(int16_t &ax, int16_t &ay, int16_t &az);
+bool initMPU6050();
+void calibrateBaseline();
+void pollMotionSensor();
+void publishMotionDiscovery();
+void publishMotionState(bool active, bool force = false);
+void logLine(const char *message);
+void logf(const char *format, ...);
+
+void logLine(const char *message) {
+  Serial.println(message);
+
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  const String topic = String(MQTT_TOPIC_BASE) + "/debug/log";
+  mqttClient.publish(topic.c_str(), message, false);
+}
+
+void logf(const char *format, ...) {
+  char message[LOG_BUFFER_SIZE];
+
+  va_list args;
+  va_start(args, format);
+  vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+
+  logLine(message);
+}
 
 void setup() {
   Serial.begin(115200);
   delay(100);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  motionSensorAvailable = initMPU6050();
+  if (motionSensorAvailable) {
+    logLine("MPU-6050 initialized");
+    calibrateBaseline();
+  } else {
+    logLine("MPU-6050 init FAILED - knock detection disabled");
+  }
 
   u8g2.begin();
   u8g2.setContrast(255);
@@ -85,11 +142,11 @@ void setup() {
   // MQTT
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setKeepAlive(15);
-  mqttClient.setSocketTimeout(10);
+  mqttClient.setSocketTimeout(2);
   if (!mqttClient.setBufferSize(MQTT_BUFFER_SIZE)) {
-    Serial.println("MQTT buffer allocation failed");
+    logLine("MQTT buffer allocation failed");
   } else {
-    Serial.printf("MQTT buffer size: %u bytes\n", MQTT_BUFFER_SIZE);
+    logf("MQTT buffer size: %u bytes", MQTT_BUFFER_SIZE);
   }
   mqttClient.setCallback([](char *topic, uint8_t *payload, unsigned int length) {
     const String topicStr(topic);
@@ -111,6 +168,13 @@ void setup() {
 
   ensureWifi();
   ensureMqtt();
+
+  // Publish clean OFF state on boot
+  if (mqttClient.connected()) {
+    publishMotionState(false, true);
+    logLine("Motion: OFF (boot)");
+  }
+
   lastActivityMs = millis();
 
   // Start ElegantOTA web server
@@ -119,10 +183,12 @@ void setup() {
   });
   ElegantOTA.begin(&otaServer);
   otaServer.begin();
-  Serial.println("ElegantOTA ready at http://" + WiFi.localIP().toString() + "/update");
+  logf("ElegantOTA ready at http://%s/update", WiFi.localIP().toString().c_str());
 }
 
 void loop() {
+  pollMotionSensor();
+
   ensureWifi();
   ensureMqtt();
   mqttClient.loop();
@@ -150,51 +216,49 @@ void loop() {
 void ensureWifi() {
   static uint32_t lastWifiAttempt = 0;
   static uint8_t wifiFailCount = 0;
+  static bool wifiConnecting = false;
+  static bool wasConnected = false;
   const uint32_t now = millis();
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (!wasConnected) {
+      logf("Wi-Fi connected, IP: %s", WiFi.localIP().toString().c_str());
+      logf("WiFi RSSI: %d dBm", WiFi.RSSI());
+    }
     wifiFailCount = 0;
+    wifiConnecting = false;
+    wasConnected = true;
     return;
   }
+  wasConnected = false;
 
-  // Non-blocking reconnect with cooldown
-  if (now - lastWifiAttempt < 3000) {
+  if (wifiConnecting) {
+    if (now - lastWifiAttempt < 15000) {
+      return;
+    }
+    logLine("Wi-Fi connect timeout");
+    wifiConnecting = false;
+  } else if (now - lastWifiAttempt < 3000) {
     return;
   }
   lastWifiAttempt = now;
 
   // After multiple failures, do a full WiFi reset
   if (wifiFailCount >= 5) {
-    Serial.println("WiFi: Too many failures, resetting WiFi stack...");
+    logLine("WiFi: Too many failures, resetting WiFi stack...");
     WiFi.disconnect(true);
-    delay(100);
     WiFi.mode(WIFI_OFF);
-    delay(100);
     WiFi.mode(WIFI_STA);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
     wifiFailCount = 0;
+    wifiConnecting = false;
   }
 
-  Serial.printf("Connecting to Wi-Fi %s...\n", WIFI_SSID);
+  logf("Connecting to Wi-Fi %s...", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  uint8_t retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) {
-    delay(500);
-    Serial.print('.');
-    retries++;
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Wi-Fi connected, IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.printf("WiFi RSSI: %d dBm\n", WiFi.RSSI());
-    wifiFailCount = 0;
-  } else {
-    Serial.println("Wi-Fi connect timeout");
-    wifiFailCount++;
-  }
+  wifiConnecting = true;
+  wifiFailCount++;
+  logLine("Wi-Fi connect started");
 }
 
 void ensureMqtt() {
@@ -211,13 +275,13 @@ void ensureMqtt() {
   lastMqttAttempt = now;
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("MQTT: WiFi not connected, skipping");
+    logLine("MQTT: WiFi not connected, skipping");
     return;
   }
 
-  Serial.println("Connecting to MQTT...");
+  logLine("Connecting to MQTT...");
   if (mqttClient.connect("esp32c3-cover", MQTT_USER, MQTT_PASS)) {
-    Serial.println("MQTT connected");
+    logf("MQTT connected, remote logs on %s/debug/log", MQTT_TOPIC_BASE);
     const String base = MQTT_TOPIC_BASE;
     mqttClient.subscribe((base + "/cover_mono").c_str());
     mqttClient.subscribe((base + "/title").c_str());
@@ -228,8 +292,145 @@ void ensureMqtt() {
     mqttClient.subscribe((base + "/play_resume").c_str());
     mqttClient.subscribe((base + "/display/set").c_str());
     publishDisplayState();
+    publishMotionDiscovery();
+    publishMotionState(motionPublished, true);
   } else {
-    Serial.printf("MQTT connect failed, rc=%d (retry in 5s)\n", mqttClient.state());
+    logf("MQTT connect failed, rc=%d (retry in 5s)", mqttClient.state());
+  }
+}
+
+bool readAccel(int16_t &ax, int16_t &ay, int16_t &az) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(MPU6050_ADDR, (uint8_t)6);
+  if (Wire.available() < 6) return false;
+  ax = (Wire.read() << 8) | Wire.read();
+  ay = (Wire.read() << 8) | Wire.read();
+  az = (Wire.read() << 8) | Wire.read();
+  return true;
+}
+
+bool initMPU6050() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  if (Wire.endTransmission(true) != 0) return false;
+
+  // Accel range +-2g (16384 LSB/g)
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1C);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+
+  // DLPF ~44 Hz
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1A);
+  Wire.write(0x03);
+  Wire.endTransmission(true);
+
+  return true;
+}
+
+void calibrateBaseline() {
+  Serial.printf("Calibrating baseline (%u samples)...\n", CALIBRATION_SAMPLES);
+  float sx = 0, sy = 0, sz = 0;
+  uint16_t good = 0;
+  for (uint16_t i = 0; i < CALIBRATION_SAMPLES; i++) {
+    int16_t ax, ay, az;
+    if (readAccel(ax, ay, az)) {
+      sx += ax / 16384.0f;
+      sy += ay / 16384.0f;
+      sz += az / 16384.0f;
+      good++;
+    }
+    delay(5);
+  }
+  if (good > 0) {
+    baseAx = sx / good;
+    baseAy = sy / good;
+    baseAz = sz / good;
+  }
+  Serial.printf("Baseline: ax=%.3f ay=%.3f az=%.3f g\n", baseAx, baseAy, baseAz);
+}
+
+void publishMotionDiscovery() {
+  if (!mqttClient.connected()) return;
+
+  const String discoveryTopic = "homeassistant/binary_sensor/esp32c3_motion/config";
+  const String stateTopic = String(MQTT_TOPIC_BASE) + "/motion/state";
+
+  String payload = "{";
+  payload += "\"name\":\"ESP32-C3 Motion\",";
+  payload += "\"unique_id\":\"esp32c3_motion_mpu6050\",";
+  payload += "\"state_topic\":\"" + stateTopic + "\",";
+  payload += "\"device_class\":\"vibration\",";
+  payload += "\"payload_on\":\"ON\",";
+  payload += "\"payload_off\":\"OFF\",";
+  payload += "\"device\":{";
+  payload += "\"identifiers\":[\"esp32c3_cover\"],";
+  payload += "\"name\":\"ESP32-C3 Mediadisplay\",";
+  payload += "\"manufacturer\":\"Espressif\",";
+  payload += "\"model\":\"ESP32-C3 Super Mini\"";
+  payload += "}";
+  payload += "}";
+
+  mqttClient.publish(discoveryTopic.c_str(), payload.c_str(), true);
+  motionDiscoverySent = true;
+  Serial.println("Motion HA discovery published");
+}
+
+void publishMotionState(bool active, bool force) {
+  const char *state = active ? "ON" : "OFF";
+
+  if (!force && motionPublished == active && !motionPublishPending) {
+    return;
+  }
+
+  motionPublished = active;
+  if (!mqttClient.connected()) {
+    motionPublishPending = true;
+    return;
+  }
+
+  const String topic = String(MQTT_TOPIC_BASE) + "/motion/state";
+  mqttClient.publish(topic.c_str(), state, true);
+  motionPublishPending = false;
+  Serial.printf("Motion: %s\n", state);
+}
+
+void pollMotionSensor() {
+  if (!motionSensorAvailable) return;
+
+  if (motionPublishPending && mqttClient.connected()) {
+    publishMotionState(motionPublished, true);
+  }
+
+  int16_t ax, ay, az;
+  if (!readAccel(ax, ay, az)) return;
+
+  const float gx = ax / 16384.0f - baseAx;
+  const float gy = ay / 16384.0f - baseAy;
+  const float gz = az / 16384.0f - baseAz;
+  const float delta = sqrtf(gx * gx + gy * gy + gz * gz);
+
+  const uint32_t now = millis();
+
+  // Knock detected
+  if (delta >= KNOCK_THRESHOLD_G && (now - motionLastKnockMs) >= KNOCK_COOLDOWN_MS) {
+    motionLastKnockMs = now;
+    motionLastTriggerMs = now;
+    Serial.printf("Knock detected (delta=%.3fg)\n", delta);
+
+    if (motionPublished && mqttClient.connected()) {
+      publishMotionState(false, true);
+    }
+    publishMotionState(true, true);
+  }
+
+  // Auto-OFF after delay
+  if (motionPublished && (now - motionLastTriggerMs) >= MOTION_OFF_DELAY_MS) {
+    publishMotionState(false, true);
   }
 }
 
